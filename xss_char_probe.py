@@ -37,25 +37,132 @@ import urllib
 # Constants
 # ---------------------------------------------------------------------------
 EXTENSION_NAME = "XSS Char Probe"
-VERSION        = "2.0"
+VERSION        = "2.1"
 
 # Probe string: unique prefix + all special chars we want to test
 PROBE_PREFIX   = "xssP"
 PROBE_CHARS    = ['<', '>', '"', "'", '`']
 PROBE_STRING   = PROBE_PREFIX + ''.join(PROBE_CHARS)   # xssP><"'`
 
-# Map each char to its expected HTML-encoded form
-ENCODED_FORMS  = {
-    '<':  ['&lt;', '&#60;', '&#x3c;', '&#x3C;'],
-    '>':  ['&gt;', '&#62;', '&#x3e;', '&#x3E;'],
-    '"':  ['&quot;', '&#34;', '&#x22;'],
-    "'":  ['&apos;', '&#39;', '&#x27;'],
-    '`':  [],   # no standard HTML encoding for backtick
+# All known encoded forms for each special char.
+# If the char appears in ANY of these forms after the probe prefix,
+# it is considered encoded and NOT flagged as a finding.
+#
+# Covers:
+#   HTML entities   : &lt;  &gt;  &quot;  &apos;
+#   Decimal entities: &#60; &#34; &#39;
+#   Hex entities    : &#x3c; &#x22; &#x27;
+#   URL encoding    : %3C  %3E  %22  %27  %60
+#   Double URL enc  : %253C %253E %2522 %2527 %2560
+#   JS hex escapes  : \x3c \x3e \x22 \x27 \x60
+#   JS unicode esc  : \u003c \u003e \u0022 \u0027
+#   JS octal        : \74 \76
+#   Backslash escape: \'  \"  (common in JS strings)
+ENCODED_FORMS = {
+    '<': [
+        '&lt;', '&#60;', '&#x3c;', '&#x3C;', '&#X3c;', '&#X3C;',
+        '%3c', '%3C',
+        '%253c', '%253C',
+        '\\x3c', '\\x3C',
+        '\\u003c', '\\u003C',
+        '\\74',
+    ],
+    '>': [
+        '&gt;', '&#62;', '&#x3e;', '&#x3E;', '&#X3e;', '&#X3E;',
+        '%3e', '%3E',
+        '%253e', '%253E',
+        '\\x3e', '\\x3E',
+        '\\u003e', '\\u003E',
+        '\\76',
+    ],
+    '"': [
+        '&quot;', '&#34;', '&#x22;', '&#X22;',
+        '%22',
+        '%2522',
+        '\\x22',
+        '\\u0022',
+        '\\"',
+    ],
+    "'": [
+        '&apos;', '&#39;', '&#x27;', '&#X27;',
+        '%27',
+        '%2527',
+        '\\x27',
+        '\\u0027',
+        "\\'",
+    ],
+    '`': [
+        '&#96;', '&#x60;', '&#X60;',
+        '%60',
+        '%2560',
+        '\\x60',
+        '\\u0060',
+    ],
 }
 
 # ---------------------------------------------------------------------------
-# Extension entry point
+# Noise filters -- reduce clutter from tracking/analytics traffic
 # ---------------------------------------------------------------------------
+
+# Parameter names to skip entirely -- never user-controlled, never interesting
+SKIP_PARAMS = set([
+    # ASP.NET internals
+    '__viewstate', '__eventvalidation', '__eventtarget', '__eventargument',
+    '__viewstategenerator', '__scrollpositionx', '__scrollpositiony',
+    '__previouspage', '__viewstateencrypted',
+    # Google Analytics / Ads tracking
+    'utm_source', 'utm_medium', 'utm_campaign', 'utm_content', 'utm_term',
+    'utm_id', 'utm_referrer',
+    'gclid', 'gbraid', 'wbraid', 'gad_source', 'gad_campaignid',
+    'gclgs', 'gclst', 'gcllp', 'gclaw', 'gclaw_src', 'gac',
+    'cq_cmp', 'cq_med', 'cq_net', 'cq_plac', 'cq_plt',
+    # Google Tag Manager / gtag internals
+    'gtm', 'gtag', 'tid', 'en', 'dl', 'dp', 'dt', 'dr',
+    # Consent / privacy
+    'gdpr', 'gdpr_consent', 'us_privacy', 'gpp', 'gpp_s', 'gpp_as',
+    'tcfe', 'npa', 'dma',
+    # Ad / conversion pixels
+    'cv', 'fst', 'bg', 'guid', 'async', 'capi', 'frm', 'fmt',
+    'tiba', 'hn', 'label', 'value', 'auid', 'uaa', 'uab', 'uafvl',
+    'uamb', 'uam', 'uap', 'uapv', 'uaw', 'ec_mode', 'random', 'rnd',
+    'ipr', 'pscrd', 'fsk', 'crd', 'cerd', 'eitems', 'cid', 'is_vtc',
+    'pscrd', 'ezwbk', 'pscdl', 'gcs', 'gcd', 'tag_exp',
+    # Generic noise
+    'ref', 'ver', 'version', 'v', 'cb', 'ts', 'timestamp', 'nonce',
+    't', 'dt', 'dpr', 'biw', 'bih', 'ei', 'opi', 'atyp',
+    'sa', 'ved', 'nis', 'pf', 'co', 'ase', 'sig', 'cce', 'category',
+])
+
+# Third-party / tracking domains to skip probing and method-swap entirely
+SKIP_DOMAINS = [
+    'google-analytics.com',
+    'googletagmanager.com',
+    'googleadservices.com',
+    'doubleclick.net',
+    'googlesyndication.com',
+    'google.co.',         # google.co.in, google.co.uk etc
+    'google.com/pagead',  # checked via path prefix
+    'google.com/aclk',
+    'google.com/client_204',
+    'google.com/url',
+    'googleapis.com',
+    'gstatic.com',
+    'facebook.com/tr',
+    'facebook.net',
+    'twitter.com/i/',
+    'analytics.',
+    'liadm.com',
+    'bing.com/action',
+    'bat.bing.com',
+    'cdn.',
+    'fonts.',
+    'gravatar.com',
+    'wp.com/i/',
+    'cloudflare.com',
+    'akamai',
+]
+
+
 class BurpExtender(IBurpExtender, IScannerCheck):
 
     def registerExtenderCallbacks(self, callbacks):
@@ -112,8 +219,19 @@ class BurpExtender(IBurpExtender, IScannerCheck):
             method = req_info.getMethod().upper()
             http_service = baseRequestResponse.getHttpService()
 
+            # ----------------------------------------------------------------
+            # Skip known tracking / analytics / ad domains entirely
+            # ----------------------------------------------------------------
+            if self._is_noisy_target(host, path):
+                return issues
+
             params = [p for p in req_info.getParameters()
-                      if p.getType() in (0, 1)]  # URL params and body params only
+                      if p.getType() in (0, 1)
+                      and not self._should_skip_param(p.getName())]
+
+            # Skip if no interesting params remain after filtering
+            if not params:
+                return issues
 
             # ----------------------------------------------------------------
             # Per-parameter probe
@@ -202,6 +320,24 @@ class BurpExtender(IBurpExtender, IScannerCheck):
             pass
         return False
 
+    def _is_noisy_target(self, host, path):
+        """
+        Return True if this host+path is a known tracking/analytics endpoint
+        that should be skipped entirely (no probing, no method swap).
+        """
+        target = (host + path).lower()
+        for pattern in SKIP_DOMAINS:
+            if pattern in target:
+                return True
+        return False
+
+    def _should_skip_param(self, name):
+        """
+        Return True if this parameter name is in the skip list --
+        internal ASP.NET tokens, tracking params, ad pixels etc.
+        """
+        return name.lower() in SKIP_PARAMS
+
     def _build_probe_request(self, request, req_info, param, probe_value):
         """
         Return a new request byte array with the probe value injected into
@@ -225,52 +361,69 @@ class BurpExtender(IBurpExtender, IScannerCheck):
 
     def _check_probe_reflection(self, body):
         """
-        Search the response body for the probe prefix, then check which
-        special characters reflect back unencoded immediately after it.
+        Search the response body for the probe prefix, then for each special
+        char determine whether it is reflected in a DANGEROUS (unencoded) way.
+
+        Context matters:
+          - In a JS string context  : backslash-escaped \" or \' IS safe
+                                      but raw < > are still dangerous
+          - In HTML context         : only HTML entities / URL encoding are safe
+          - In all contexts         : URL encoding and JS hex/unicode are safe
 
         Returns:
-          reflected_chars : list of chars that reflected unencoded e.g. ['<', '"']
-          context         : 'html_attr', 'html_tag', 'js_string', 'html_text', 'unknown'
+          reflected_chars : list of chars reflected dangerously e.g. ['<', '"']
+          context         : 'html_attr'|'html_tag'|'js_string'|'html_text'|'unknown'
         """
         reflected = []
         context   = 'unknown'
 
-        # Find where our probe prefix landed in the response
         probe_idx = body.find(PROBE_PREFIX)
         if probe_idx == -1:
             return reflected, context
 
-        # Grab a window around the probe to check context and chars
-        window_start = max(0, probe_idx - 100)
-        window_end   = min(len(body), probe_idx + len(PROBE_STRING) + 50)
-        window       = body[window_start:window_end]
+        # Determine context BEFORE checking chars so we can apply context rules
+        context = self._determine_context(body, probe_idx)
 
-        # Extract what came after the prefix
         after_prefix = body[probe_idx + len(PROBE_PREFIX):]
+        after_lower  = after_prefix.lower()
 
-        # Check each special char
         for ch in PROBE_CHARS:
-            # Check if the raw char appears right after the prefix
-            # before any encoded form could appear
-            char_pos = after_prefix.find(ch)
-            if char_pos == -1:
+            raw_pos = after_prefix.find(ch)
+            if raw_pos == -1:
+                # Raw char not present at all -- safe (stripped or encoded)
                 continue
 
-            # Make sure it is NOT an encoded equivalent
-            encoded = False
-            for enc_form in ENCODED_FORMS.get(ch, []):
-                if enc_form in after_prefix[:char_pos + 10]:
-                    encoded = True
-                    break
+            # Check the window just before and around the raw char position
+            search_window = after_lower[:raw_pos + 20]
 
-            if not encoded:
-                reflected.append(ch)
+            # Build the safe encoding list for this char + context
+            safe_forms = list(ENCODED_FORMS.get(ch, []))
 
-        # Determine context from what precedes the probe in the response
-        if reflected:
-            context = self._determine_context(body, probe_idx)
+            # In a JS string context, backslash escaping is safe ONLY for
+            # the matching quote character:
+            #   \" is safe for "  (server escaped the double quote)
+            #   \' is safe for '  (server escaped the single quote)
+            # Do NOT cross-add -- \" does not make ' safe and vice versa.
+            if context == 'js_string':
+                if ch == '"':
+                    safe_forms.append('\\"')
+                elif ch == "'":
+                    safe_forms.append("\\'")
+
+            is_encoded = any(
+                enc.lower() in search_window
+                for enc in safe_forms
+            )
+
+            if is_encoded:
+                continue
+
+            # Raw char present with no safe encoding around it -- flag it
+            reflected.append(ch)
 
         return reflected, context
+
+
 
     def _determine_context(self, body, probe_idx):
         """
@@ -321,95 +474,198 @@ class BurpExtender(IBurpExtender, IScannerCheck):
 
     def _test_method_swap(self, brr, req_info, http_service, url):
         """
-        Test the endpoint once with the opposite HTTP method.
-        GET -> POST (move URL params to body)
-        POST -> GET (move body params to URL)
-
-        Sends ONE extra request per endpoint.
-        Reports if the swap returns a 200 (may indicate missing method checks).
+        1. Build the swapped request (GET->POST or POST->GET)
+        2. Send it once to check if the endpoint accepts the swapped method
+        3. If accepted (HTTP 200 + text/html), run the full XSS char probe
+           on every parameter in the swapped request -- same probe logic
+           used for the original method
         """
         issues  = []
         method  = req_info.getMethod().upper()
-        request = brr.getRequest()
         params  = list(req_info.getParameters())
 
-        query_params = [p for p in params if p.getType() == 0]
-        body_params  = [p for p in params if p.getType() == 1]
+        query_params = [p for p in params if p.getType() == 0]  # URL params
+        body_params  = [p for p in params if p.getType() == 1]  # Body params
 
         try:
+            # ----------------------------------------------------------------
+            # Build the swapped base request (no probe yet, original values)
+            # ----------------------------------------------------------------
             if method == "GET" and query_params:
-                # Convert GET -> POST: move URL params into body
-                new_body = '&'.join(
+                swap_label   = "GET-to-POST"
+                swapped_params = query_params
+                new_param_type = 1   # will inject as body params
+
+                base_body = '&'.join(
                     "{}={}".format(
                         urllib.quote(p.getName(), safe=''),
                         urllib.quote(p.getValue(), safe=''))
                     for p in query_params
                 )
-                # Build POST request: strip query string, add body
-                path_only = url.getPath()
-                headers   = [
-                    "POST {} HTTP/1.1".format(path_only),
+                base_headers = [
+                    "POST {} HTTP/1.1".format(url.getPath()),
                     "Host: {}".format(url.getHost()),
                     "Content-Type: application/x-www-form-urlencoded",
-                    "Content-Length: {}".format(len(new_body)),
+                    "Content-Length: {}".format(len(base_body)),
                     "Connection: close",
                 ]
-                new_request = self._helpers.buildHttpMessage(
-                    headers, self._helpers.stringToBytes(new_body))
-                swap_label = "GET-to-POST"
+                base_swapped_request = self._helpers.buildHttpMessage(
+                    base_headers, self._helpers.stringToBytes(base_body))
 
             elif method == "POST" and body_params:
-                # Convert POST -> GET: move body params to query string
+                swap_label   = "POST-to-GET"
+                swapped_params = body_params
+                new_param_type = 0   # will inject as URL params
+
                 qs = '&'.join(
                     "{}={}".format(
                         urllib.quote(p.getName(), safe=''),
                         urllib.quote(p.getValue(), safe=''))
                     for p in body_params
                 )
-                path_qs = "{}?{}".format(url.getPath(), qs)
-                headers = [
-                    "GET {} HTTP/1.1".format(path_qs),
+                base_headers = [
+                    "GET {}?{} HTTP/1.1".format(url.getPath(), qs),
                     "Host: {}".format(url.getHost()),
                     "Connection: close",
                 ]
-                new_request = self._helpers.buildHttpMessage(headers, None)
-                swap_label  = "POST-to-GET"
+                base_swapped_request = self._helpers.buildHttpMessage(
+                    base_headers, None)
             else:
                 return issues
 
-            swap_response = self._callbacks.makeHttpRequest(
-                http_service, new_request)
-            if swap_response is None:
+            # ----------------------------------------------------------------
+            # Step 1: Send base swapped request to check if method is accepted
+            # ----------------------------------------------------------------
+            base_swap_resp = self._callbacks.makeHttpRequest(
+                http_service, base_swapped_request)
+            if base_swap_resp is None:
                 return issues
 
-            swap_resp_bytes = swap_response.getResponse()
-            if swap_resp_bytes is None:
+            base_resp_bytes = base_swap_resp.getResponse()
+            if base_resp_bytes is None:
                 return issues
 
-            swap_resp_info  = self._helpers.analyzeResponse(swap_resp_bytes)
-            status_code     = swap_resp_info.getStatusCode()
+            base_resp_info = self._helpers.analyzeResponse(base_resp_bytes)
+            status_code    = base_resp_info.getStatusCode()
 
-            # Flag if the swapped method returned 200 OK
-            if status_code == 200:
-                detail = (
+            self._log("[MethodSwap] {} | {} | status={}".format(
+                swap_label, url, status_code))
+
+            # Only continue probing if the swap was accepted with HTML response
+            if status_code != 200 or not self._is_html_response(base_resp_bytes):
+                if status_code != 200:
+                    detail = (
+                        "Method swap <b>{}</b> on <b>{}</b> returned HTTP {}. "
+                        "Endpoint does not appear to accept the swapped method."
+                    ).format(swap_label, url, status_code)
+                    issues.append(XSSIssue(
+                        base_swap_resp, url,
+                        "[XSS Probe] Method Swap Rejected ({})".format(swap_label),
+                        detail, "Information", "Certain"
+                    ))
+                return issues
+
+            # ----------------------------------------------------------------
+            # Step 2: Method accepted -- report it
+            # ----------------------------------------------------------------
+            issues.append(XSSIssue(
+                base_swap_resp, url,
+                "[XSS Probe] Method Swap Accepted ({})".format(swap_label),
+                (
                     "Method swap <b>{}</b> on <b>{}</b> returned HTTP 200.<br><br>"
                     "The endpoint accepts both methods. This may indicate:<br>"
                     "- Missing method-specific input validation<br>"
                     "- WAF rules that only cover one method<br>"
                     "- CSRF protections tied to POST only<br><br>"
-                    "Recommendation: Manually test the swapped method with "
-                    "XSS probe characters in all parameters."
-                ).format(swap_label, url)
-                issues.append(XSSIssue(
-                    swap_response, url,
-                    "[XSS Probe] Method Swap Accepted ({})".format(swap_label),
-                    detail, "Information", "Certain"
-                ))
-                self._log("[MethodSwap] {} -> {} | {} | status=200".format(
-                    method, swap_label, url))
-            else:
-                self._log("[MethodSwap] {} -> {} | {} | status={}".format(
-                    method, swap_label, url, status_code))
+                    "Now probing all parameters via the swapped method..."
+                ).format(swap_label, url),
+                "Information", "Certain"
+            ))
+
+            # ----------------------------------------------------------------
+            # Step 3: Probe each parameter via the swapped method
+            # One request per param, inject PROBE_STRING, check reflection
+            # ----------------------------------------------------------------
+            for param in swapped_params:
+                param_name = param.getName()
+                dedup_key  = (url.getHost(), url.getPath(),
+                              param_name + "_" + swap_label)
+
+                if dedup_key in self._seen_params:
+                    continue
+                self._seen_params.add(dedup_key)
+
+                encoded_probe = urllib.quote(PROBE_STRING, safe='')
+
+                # Build probed swapped request for this param
+                if swap_label == "GET-to-POST":
+                    # Rebuild POST body with probe in this param only
+                    probe_body = '&'.join(
+                        "{}={}".format(
+                            urllib.quote(p.getName(), safe=''),
+                            encoded_probe if p.getName() == param_name
+                            else urllib.quote(p.getValue(), safe=''))
+                        for p in swapped_params
+                    )
+                    probe_headers = [
+                        "POST {} HTTP/1.1".format(url.getPath()),
+                        "Host: {}".format(url.getHost()),
+                        "Content-Type: application/x-www-form-urlencoded",
+                        "Content-Length: {}".format(len(probe_body)),
+                        "Connection: close",
+                    ]
+                    probe_request = self._helpers.buildHttpMessage(
+                        probe_headers,
+                        self._helpers.stringToBytes(probe_body))
+
+                else:
+                    # Rebuild GET query string with probe in this param only
+                    probe_qs = '&'.join(
+                        "{}={}".format(
+                            urllib.quote(p.getName(), safe=''),
+                            encoded_probe if p.getName() == param_name
+                            else urllib.quote(p.getValue(), safe=''))
+                        for p in swapped_params
+                    )
+                    probe_headers = [
+                        "GET {}?{} HTTP/1.1".format(url.getPath(), probe_qs),
+                        "Host: {}".format(url.getHost()),
+                        "Connection: close",
+                    ]
+                    probe_request = self._helpers.buildHttpMessage(
+                        probe_headers, None)
+
+                probe_resp = self._callbacks.makeHttpRequest(
+                    http_service, probe_request)
+                if probe_resp is None:
+                    continue
+
+                probe_resp_bytes = probe_resp.getResponse()
+                if probe_resp_bytes is None:
+                    continue
+
+                probe_resp_info = self._helpers.analyzeResponse(probe_resp_bytes)
+                probe_body_str  = self._helpers.bytesToString(
+                    probe_resp_bytes[probe_resp_info.getBodyOffset():])
+
+                reflected_chars, context = self._check_probe_reflection(
+                    probe_body_str)
+
+                if reflected_chars:
+                    severity = self._get_severity(reflected_chars)
+                    detail   = self._build_detail(
+                        url, param_name,
+                        "POST (swapped)" if swap_label == "GET-to-POST" else "GET (swapped)",
+                        reflected_chars, context, PROBE_STRING)
+                    issues.append(XSSIssue(
+                        probe_resp, url,
+                        "[XSS Probe] Special Chars Reflected via {} -- param: {}".format(
+                            swap_label, param_name),
+                        detail, severity, "Firm"
+                    ))
+                    self._log("[{}][{}] {} | param={} | reflected: {} | ctx={}".format(
+                        severity, swap_label, url, param_name,
+                        ', '.join(reflected_chars), context))
 
         except Exception as e:
             self._log("[WARN] Method swap failed: {}".format(str(e)))
