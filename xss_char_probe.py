@@ -472,6 +472,33 @@ class BurpExtender(IBurpExtender, IScannerCheck):
             return "Medium"
         return "Low"
 
+    def _get_original_headers(self, req_info):
+        """
+        Extract headers from the original request that should be carried
+        over to the swapped request: Host, Cookie, User-Agent, Accept,
+        Accept-Language, Referer, Authorization, and any X- headers.
+
+        Strips Content-Type and Content-Length (caller sets these).
+        Strips the request line (first header).
+        Returns a list of header strings ready for buildHttpMessage().
+        """
+        skip_prefixes = (
+            'content-type:', 'content-length:',
+            'transfer-encoding:', 'connection:'
+        )
+        headers = req_info.getHeaders()
+        result  = []
+        for i, h in enumerate(headers):
+            if i == 0:
+                # Skip the original request line (GET /path HTTP/1.1)
+                continue
+            if h.lower().startswith(skip_prefixes):
+                continue
+            result.append(h)
+        # Always ensure Connection: close is present
+        result.append("Connection: close")
+        return result
+
     def _test_method_swap(self, brr, req_info, http_service, url):
         """
         1. Build the swapped request (GET->POST or POST->GET)
@@ -492,9 +519,11 @@ class BurpExtender(IBurpExtender, IScannerCheck):
             # Build the swapped base request (no probe yet, original values)
             # ----------------------------------------------------------------
             if method == "GET" and query_params:
-                swap_label   = "GET-to-POST"
-                swapped_params = query_params
-                new_param_type = 1   # will inject as body params
+                swap_label     = "GET-to-POST"
+                swapped_params = [p for p in query_params
+                                  if not self._should_skip_param(p.getName())]
+                if not swapped_params:
+                    return issues
 
                 base_body = '&'.join(
                     "{}={}".format(
@@ -502,20 +531,26 @@ class BurpExtender(IBurpExtender, IScannerCheck):
                         urllib.quote(p.getValue(), safe=''))
                     for p in query_params
                 )
-                base_headers = [
-                    "POST {} HTTP/1.1".format(url.getPath()),
-                    "Host: {}".format(url.getHost()),
-                    "Content-Type: application/x-www-form-urlencoded",
-                    "Content-Length: {}".format(len(base_body)),
-                    "Connection: close",
-                ]
+                # Carry original headers (Host, Cookie, User-Agent etc.)
+                # but replace the request line and add Content-Type/Length
+                orig_headers = self._get_original_headers(req_info)
+                base_headers = (
+                    ["POST {} HTTP/1.1".format(url.getPath())]
+                    + orig_headers
+                    + [
+                        "Content-Type: application/x-www-form-urlencoded",
+                        "Content-Length: {}".format(len(base_body)),
+                    ]
+                )
                 base_swapped_request = self._helpers.buildHttpMessage(
                     base_headers, self._helpers.stringToBytes(base_body))
 
             elif method == "POST" and body_params:
-                swap_label   = "POST-to-GET"
-                swapped_params = body_params
-                new_param_type = 0   # will inject as URL params
+                swap_label     = "POST-to-GET"
+                swapped_params = [p for p in body_params
+                                  if not self._should_skip_param(p.getName())]
+                if not swapped_params:
+                    return issues
 
                 qs = '&'.join(
                     "{}={}".format(
@@ -523,11 +558,11 @@ class BurpExtender(IBurpExtender, IScannerCheck):
                         urllib.quote(p.getValue(), safe=''))
                     for p in body_params
                 )
-                base_headers = [
-                    "GET {}?{} HTTP/1.1".format(url.getPath(), qs),
-                    "Host: {}".format(url.getHost()),
-                    "Connection: close",
-                ]
+                orig_headers = self._get_original_headers(req_info)
+                base_headers = (
+                    ["GET {}?{} HTTP/1.1".format(url.getPath(), qs)]
+                    + orig_headers
+                )
                 base_swapped_request = self._helpers.buildHttpMessage(
                     base_headers, None)
             else:
@@ -598,8 +633,8 @@ class BurpExtender(IBurpExtender, IScannerCheck):
                 encoded_probe = urllib.quote(PROBE_STRING, safe='')
 
                 # Build probed swapped request for this param
+                # Re-use orig_headers so cookies are always included
                 if swap_label == "GET-to-POST":
-                    # Rebuild POST body with probe in this param only
                     probe_body = '&'.join(
                         "{}={}".format(
                             urllib.quote(p.getName(), safe=''),
@@ -607,19 +642,19 @@ class BurpExtender(IBurpExtender, IScannerCheck):
                             else urllib.quote(p.getValue(), safe=''))
                         for p in swapped_params
                     )
-                    probe_headers = [
-                        "POST {} HTTP/1.1".format(url.getPath()),
-                        "Host: {}".format(url.getHost()),
-                        "Content-Type: application/x-www-form-urlencoded",
-                        "Content-Length: {}".format(len(probe_body)),
-                        "Connection: close",
-                    ]
+                    probe_headers = (
+                        ["POST {} HTTP/1.1".format(url.getPath())]
+                        + orig_headers
+                        + [
+                            "Content-Type: application/x-www-form-urlencoded",
+                            "Content-Length: {}".format(len(probe_body)),
+                        ]
+                    )
                     probe_request = self._helpers.buildHttpMessage(
                         probe_headers,
                         self._helpers.stringToBytes(probe_body))
 
                 else:
-                    # Rebuild GET query string with probe in this param only
                     probe_qs = '&'.join(
                         "{}={}".format(
                             urllib.quote(p.getName(), safe=''),
@@ -627,11 +662,10 @@ class BurpExtender(IBurpExtender, IScannerCheck):
                             else urllib.quote(p.getValue(), safe=''))
                         for p in swapped_params
                     )
-                    probe_headers = [
-                        "GET {}?{} HTTP/1.1".format(url.getPath(), probe_qs),
-                        "Host: {}".format(url.getHost()),
-                        "Connection: close",
-                    ]
+                    probe_headers = (
+                        ["GET {}?{} HTTP/1.1".format(url.getPath(), probe_qs)]
+                        + orig_headers
+                    )
                     probe_request = self._helpers.buildHttpMessage(
                         probe_headers, None)
 
@@ -705,7 +739,7 @@ class BurpExtender(IBurpExtender, IScannerCheck):
 
 
 # ---------------------------------------------------------------------------
-# Swing UI Tab
+# Swing UI Tab -- colored log using JTextPane + StyledDocument
 # ---------------------------------------------------------------------------
 class XSSTab(ITab):
 
@@ -719,14 +753,38 @@ class XSSTab(ITab):
         header.setFont(Font("Monospaced", Font.BOLD, 13))
         header.setForeground(Color(220, 80, 80))
 
-        self._log_area = JTextArea()
-        self._log_area.setEditable(False)
-        self._log_area.setFont(Font("Monospaced", Font.PLAIN, 12))
-        self._log_area.setBackground(Color(18, 18, 18))
-        self._log_area.setForeground(Color(160, 255, 160))
-        self._log_area.setLineWrap(True)
+        # JTextPane supports per-line colors via StyledDocument
+        from javax.swing import JTextPane
+        from javax.swing.text import SimpleAttributeSet, StyleConstants
+        from java.awt import Color as JColor
 
-        scroll = JScrollPane(self._log_area)
+        self._text_pane = JTextPane()
+        self._text_pane.setEditable(False)
+        self._text_pane.setFont(Font("Monospaced", Font.PLAIN, 12))
+        self._text_pane.setBackground(Color(18, 18, 18))
+
+        # Store imports for use in append()
+        self._SimpleAttributeSet = SimpleAttributeSet
+        self._StyleConstants      = StyleConstants
+
+        # Pre-build named styles
+        self._styles = {}
+        color_map = {
+            'high':   JColor(255,  80,  80),   # red
+            'medium': JColor(255, 180,  50),   # orange
+            'low':    JColor(255, 230, 100),   # yellow
+            'swap':   JColor(100, 180, 255),   # blue
+            'info':   JColor(160, 255, 160),   # green (default)
+            'error':  JColor(255,  60,  60),   # bright red
+        }
+        for name, color in color_map.items():
+            style = SimpleAttributeSet()
+            StyleConstants.setForeground(style, color)
+            StyleConstants.setFontFamily(style, "Monospaced")
+            StyleConstants.setFontSize(style, 12)
+            self._styles[name] = style
+
+        scroll = JScrollPane(self._text_pane)
         scroll.setPreferredSize(Dimension(900, 600))
 
         clear_btn = JButton("Clear Log + Reset Dedup Cache")
@@ -743,12 +801,38 @@ class XSSTab(ITab):
         return self._panel
 
     def append(self, msg):
-        self._log_area.append(msg + "\n")
-        self._log_area.setCaretPosition(
-            self._log_area.getDocument().getLength())
+        """
+        Append a colored line based on severity prefix in the message.
+        [High]   -> red
+        [Medium] -> orange
+        [Low]    -> yellow
+        [MethodSwap] / [GET-to-POST] / [POST-to-GET] -> blue
+        [ERROR]  -> bright red
+        default  -> green
+        """
+        msg_lower = msg.lower()
+        if '[high]' in msg_lower or '[error]' in msg_lower:
+            style_key = 'high' if '[high]' in msg_lower else 'error'
+        elif '[medium]' in msg_lower:
+            style_key = 'medium'
+        elif '[low]' in msg_lower:
+            style_key = 'low'
+        elif any(x in msg_lower for x in ['[methodswap]', '[get-to-post]',
+                                           '[post-to-get]', 'swap']):
+            style_key = 'swap'
+        else:
+            style_key = 'info'
+
+        style = self._styles[style_key]
+        doc   = self._text_pane.getStyledDocument()
+        try:
+            doc.insertString(doc.getLength(), msg + "\n", style)
+        except Exception:
+            pass
+        self._text_pane.setCaretPosition(doc.getLength())
 
     def _clear(self):
-        self._log_area.setText("")
+        self._text_pane.setText("")
         self._extender._seen_params.clear()
         self._extender._seen_methods.clear()
         self.append("[ Log cleared -- dedup cache reset ]")
