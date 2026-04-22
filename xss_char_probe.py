@@ -60,12 +60,19 @@ PROBE_STRING   = PROBE_PREFIX + ''.join(PROBE_CHARS)   # xssP><"'`
 #   Backslash escape: \'  \"  (common in JS strings)
 ENCODED_FORMS = {
     '<': [
+        # HTML entities
         '&lt;', '&#60;', '&#x3c;', '&#x3C;', '&#X3c;', '&#X3C;',
+        # URL encoding
         '%3c', '%3C',
+        # Double URL encoding
         '%253c', '%253C',
+        # JS hex / unicode escapes
         '\\x3c', '\\x3C',
         '\\u003c', '\\u003C',
+        # JS octal
         '\\74',
+        # JSON unicode-escaped HTML entity e.g. \u0026lt; (\u0026 = &)
+        '\\u0026lt;', '\\u0026#60;',
     ],
     '>': [
         '&gt;', '&#62;', '&#x3e;', '&#x3E;', '&#X3e;', '&#X3E;',
@@ -74,6 +81,7 @@ ENCODED_FORMS = {
         '\\x3e', '\\x3E',
         '\\u003e', '\\u003E',
         '\\76',
+        '\\u0026gt;', '\\u0026#62;',
     ],
     '"': [
         '&quot;', '&#34;', '&#x22;', '&#X22;',
@@ -82,6 +90,7 @@ ENCODED_FORMS = {
         '\\x22',
         '\\u0022',
         '\\"',
+        '\\u0026quot;',
     ],
     "'": [
         '&apos;', '&#39;', '&#x27;', '&#X27;',
@@ -90,7 +99,13 @@ ENCODED_FORMS = {
         '\\x27',
         '\\u0027',
         "\\'",
+        '\\u0026apos;', '\\u0026#39;',
     ],
+    # Backtick: no standard HTML encoding exists.
+    # A raw ` is only dangerous inside JS template literals.
+    # We deliberately keep this list short -- the real protection is
+    # the _is_dangerous_reflection() check below which requires at least
+    # one of < > " ' to also be unencoded before flagging backtick alone.
     '`': [
         '&#96;', '&#x60;', '&#X60;',
         '%60',
@@ -99,6 +114,11 @@ ENCODED_FORMS = {
         '\\u0060',
     ],
 }
+
+# Chars that are dangerous on their own (can break HTML / attributes).
+# A raw backtick alone is NOT sufficient to flag a finding -- it needs
+# at least one of these to also be unencoded.
+DANGEROUS_CHARS = set(['<', '>', '"', "'"])
 
 # ---------------------------------------------------------------------------
 # Noise filters -- reduce clutter from tracking/analytics traffic
@@ -420,6 +440,13 @@ class BurpExtender(IBurpExtender, IScannerCheck):
 
             # Raw char present with no safe encoding around it -- flag it
             reflected.append(ch)
+
+        # Backtick alone is not sufficient for a finding.
+        # It is only dangerous alongside < > " ' (needed to break out of
+        # a template literal context that is itself breakable).
+        # If the only reflected char is ` suppress the finding entirely.
+        if reflected == ['`']:
+            reflected = []
 
         return reflected, context
 
