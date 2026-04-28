@@ -27,8 +27,10 @@ Installation:
      just browse normally -- the extension hooks doActiveScan insertion points
 """
 
-from burp import IBurpExtender, IScannerCheck, IScanIssue, ITab
-from javax.swing import JPanel, JScrollPane, JTextArea, JLabel, JButton
+from burp import (IBurpExtender, IScannerCheck, IScanIssue, ITab,
+                  IContextMenuFactory)
+from javax.swing import (JPanel, JScrollPane, JTextArea, JLabel, JButton,
+                         JMenuItem)
 from java.awt import BorderLayout, Font, Color, Dimension
 import re
 import urllib
@@ -183,7 +185,7 @@ SKIP_DOMAINS = [
 ]
 
 
-class BurpExtender(IBurpExtender, IScannerCheck):
+class BurpExtender(IBurpExtender, IScannerCheck, IContextMenuFactory):
 
     def registerExtenderCallbacks(self, callbacks):
         self._callbacks = callbacks
@@ -195,6 +197,7 @@ class BurpExtender(IBurpExtender, IScannerCheck):
 
         callbacks.setExtensionName(EXTENSION_NAME)
         callbacks.registerScannerCheck(self)
+        callbacks.registerContextMenuFactory(self)
 
         self._tab = XSSTab(self)
         callbacks.addSuiteTab(self._tab)
@@ -202,7 +205,50 @@ class BurpExtender(IBurpExtender, IScannerCheck):
         self._log("[ {} v{} loaded ]".format(EXTENSION_NAME, VERSION))
         self._log("Probe string: {}".format(PROBE_STRING))
         self._log("Only scanning Content-Type: text/html responses.")
+        self._log("Right-click any request -> 'Re-scan with XSS Char Probe' to force re-scan")
         self._log("-" * 60)
+
+    # -----------------------------------------------------------------------
+    # IContextMenuFactory -- adds right-click menu in Burp
+    # -----------------------------------------------------------------------
+    def createMenuItems(self, invocation):
+        menu_items = []
+        selected = invocation.getSelectedMessages()
+        if selected and len(selected) > 0:
+            item = JMenuItem("Re-scan with XSS Char Probe")
+            def action(event, msgs=selected):
+                self._force_rescan(msgs)
+            item.addActionListener(lambda e: action(e))
+            menu_items.append(item)
+        return menu_items
+
+    def _force_rescan(self, messages):
+        """
+        Force re-scan of selected request(s), bypassing the dedup cache.
+        Called from the right-click context menu.
+        """
+        for msg in messages:
+            try:
+                req_info = self._helpers.analyzeRequest(msg)
+                url      = req_info.getUrl()
+                host     = url.getHost()
+                path     = url.getPath()
+
+                # Clear dedup entries for this request so doPassiveScan re-runs
+                # all params and method swap from scratch
+                params = [p for p in req_info.getParameters()
+                          if p.getType() in (0, 1)]
+                for p in params:
+                    self._seen_params.discard((host, path, p.getName()))
+                self._seen_methods.discard((host, path))
+
+                self._log("[Rescan] Cleared cache for {} -- running scan now".format(url))
+
+                # Trigger the scan manually
+                issues = self.doPassiveScan(msg)
+                self._log("[Rescan] Done -- {} issues reported".format(len(issues)))
+            except Exception as e:
+                self._log("[ERROR] Rescan failed: {}".format(str(e)))
 
     # -----------------------------------------------------------------------
     # IScannerCheck - active scan insertion point
@@ -274,18 +320,26 @@ class BurpExtender(IBurpExtender, IScannerCheck):
                 probe_response = self._callbacks.makeHttpRequest(
                     http_service, probe_request)
                 if probe_response is None:
+                    self._log("[WARN] No probe response | {} param={}".format(
+                        url, param_name))
                     continue
 
                 probe_resp_bytes = probe_response.getResponse()
                 if probe_resp_bytes is None:
+                    self._log("[WARN] Probe response empty | {} param={}".format(
+                        url, param_name))
                     continue
 
                 probe_resp_info = self._helpers.analyzeResponse(probe_resp_bytes)
                 probe_body = self._helpers.bytesToString(
                     probe_resp_bytes[probe_resp_info.getBodyOffset():])
 
+                # Diagnostic: was probe prefix even in the response?
+                probe_found = PROBE_PREFIX in probe_body
+
                 # Check which chars reflected unencoded
-                reflected_chars, context = self._check_probe_reflection(probe_body)
+                reflected_chars, context = self._check_probe_reflection(
+                    probe_body, param.getValue())
 
                 if reflected_chars:
                     severity = self._get_severity(reflected_chars)
@@ -300,6 +354,10 @@ class BurpExtender(IBurpExtender, IScannerCheck):
                     self._log("[{}] {} | param={} | reflected: {} | ctx={}".format(
                         severity, url, param_name,
                         ', '.join(reflected_chars), context))
+                elif not probe_found:
+                    # Probe was filtered/stripped by server -- worth noting
+                    self._log("[Filtered] {} | param={} | probe not in response".format(
+                        url, param_name))
 
             # ----------------------------------------------------------------
             # Method-swap test (once per endpoint)
@@ -358,134 +416,250 @@ class BurpExtender(IBurpExtender, IScannerCheck):
         """
         return name.lower() in SKIP_PARAMS
 
+    def _is_base64_value(self, value):
+        """
+        Return True if the parameter value looks like a base64-encoded string
+        or a JWT (which contains base64 segments separated by dots).
+        These values should not be replaced -- probe is appended after them.
+        """
+        if len(value) < 16:
+            return False
+        # JWT: three base64url segments separated by dots
+        if value.count('.') == 2:
+            parts = value.split('.')
+            b64url = re.compile(r'^[A-Za-z0-9_\-]+=*$')
+            if all(b64url.match(p) for p in parts if p):
+                return True
+        # Standard and URL-safe base64 (no dots)
+        b64_re = re.compile(r'^[A-Za-z0-9+/=_\-]{16,}$')
+        return bool(b64_re.match(value))
+
     def _build_probe_request(self, request, req_info, param, probe_value):
         """
-        Return a new request byte array with the probe value injected into
-        the given parameter.  All other parameters are left unchanged.
+        Build a probe request by injecting the probe string into the parameter.
+
+        For normal params:
+          Replace the value entirely with the probe.
+          e.g. q=hello  ->  q=xssP%3C%3E%22%27%60
+
+        For base64-looking params:
+          Append the probe AFTER the base64 value using a raw delimiter.
+          The base64 value is kept intact so the server can decode it,
+          then the probe chars break out of whatever context the value
+          lands in.
+          e.g. encodedParams=bG9naW5Q  ->  encodedParams=bG9naW5Q%22%3ExssP%3C%3E%22%27%60
+          The " and > before xssP attempt to break out of the HTML context
+          before the probe prefix, maximising the chance xssP survives.
         """
         try:
-            # URL-encode the probe for safe transport
-            encoded_probe = urllib.quote(probe_value, safe='')
-            new_request = self._helpers.updateParameter(
-                request,
-                self._helpers.buildParameter(
-                    param.getName(),
-                    encoded_probe,
-                    param.getType()
+            original_value = param.getValue()
+
+            if self._is_base64_value(original_value):
+                # For base64 params inject breakout chars RAW (not URL-encoded)
+                # so the server sees literal " > that break the HTML context.
+                # We do a raw string replacement in the request bytes to avoid
+                # Burp's updateParameter URL-encoding the breakout chars.
+                encoded_probe = urllib.quote(probe_value, safe='')
+                # Final injected value: base64value + raw "> + url-encoded probe
+                # e.g. bG9naW5Q">xssP%3C%3E%22%27%60
+                injected_value = original_value + '">' + encoded_probe
+
+                raw_request = self._helpers.bytesToString(request)
+
+                # Try to find and replace the exact value as it appears in request
+                # Could be URL-encoded or raw depending on how Burp parsed it
+                url_encoded_orig = urllib.quote(original_value, safe='')
+
+                if url_encoded_orig in raw_request:
+                    new_raw = raw_request.replace(
+                        url_encoded_orig, injected_value, 1)
+                elif original_value in raw_request:
+                    new_raw = raw_request.replace(
+                        original_value, injected_value, 1)
+                else:
+                    # Cannot locate value in raw request -- fall back to normal probe
+                    encoded_probe2 = urllib.quote(probe_value, safe='')
+                    return self._helpers.updateParameter(
+                        request,
+                        self._helpers.buildParameter(
+                            param.getName(), encoded_probe2, param.getType()))
+
+                new_request = self._helpers.stringToBytes(new_raw)
+                self._log("[b64] {} -- raw breakout injection".format(
+                    param.getName()))
+            else:
+                # Normal param: replace value with probe
+                encoded_probe = urllib.quote(probe_value, safe='')
+                new_request = self._helpers.updateParameter(
+                    request,
+                    self._helpers.buildParameter(
+                        param.getName(),
+                        encoded_probe,
+                        param.getType()
+                    )
                 )
-            )
             return new_request
+
         except Exception as e:
             self._log("[WARN] Could not build probe request: {}".format(str(e)))
             return None
 
-    def _check_probe_reflection(self, body):
+    def _check_probe_reflection(self, body, original_value=None):
         """
-        Search the response body for the probe prefix, then for each special
-        char determine whether it is reflected in a DANGEROUS (unencoded) way.
+        Check ALL occurrences of PROBE_PREFIX in the response body.
+        A page may reflect the same value multiple times in different contexts:
+        one place may HTML-encode it (safe), another may reflect it raw (XSS).
+        We return the WORST case -- the occurrence with the most unencoded chars.
 
-        Context matters:
-          - In a JS string context  : backslash-escaped \" or \' IS safe
-                                      but raw < > are still dangerous
-          - In HTML context         : only HTML entities / URL encoding are safe
-          - In all contexts         : URL encoding and JS hex/unicode are safe
+        For each xssP occurrence:
+          1. Check chars immediately after for raw vs encoded
+          2. For base64 params, also check breakout chars `">` before xssP
 
-        Returns:
-          reflected_chars : list of chars reflected dangerously e.g. ['<', '"']
-          context         : 'html_attr'|'html_tag'|'js_string'|'html_text'|'unknown'
+        Returns the union of all dangerous chars found across occurrences.
         """
         reflected = []
         context   = 'unknown'
 
-        probe_idx = body.find(PROBE_PREFIX)
-        if probe_idx == -1:
+        # Find ALL positions of xssP, not just the first
+        all_positions = []
+        pos = 0
+        while True:
+            idx = body.find(PROBE_PREFIX, pos)
+            if idx == -1:
+                break
+            all_positions.append(idx)
+            pos = idx + 1
+
+        if not all_positions:
             return reflected, context
 
-        # Determine context BEFORE checking chars so we can apply context rules
-        context = self._determine_context(body, probe_idx)
+        # Track best (most dangerous) reflection
+        best_chars   = []
+        best_context = 'unknown'
 
-        after_prefix = body[probe_idx + len(PROBE_PREFIX):]
-        after_lower  = after_prefix.lower()
+        for probe_idx in all_positions:
+            occurrence_chars = []
+            occurrence_ctx   = self._determine_context(body, probe_idx)
 
-        for ch in PROBE_CHARS:
-            raw_pos = after_prefix.find(ch)
-            if raw_pos == -1:
-                # Raw char not present at all -- safe (stripped or encoded)
-                continue
+            after_prefix = body[probe_idx + len(PROBE_PREFIX):]
+            after_lower  = after_prefix.lower()
 
-            # Check the window just before and around the raw char position
-            search_window = after_lower[:raw_pos + 20]
+            # Check chars AFTER xssP at this occurrence
+            for ch in PROBE_CHARS:
+                raw_pos = after_prefix.find(ch)
+                if raw_pos == -1:
+                    continue
+                # Stop searching after we hit a non-probe char (likely end of value)
+                # so we don't pick up encoded forms from elsewhere on the page
+                search_window = after_lower[:min(raw_pos + 20, 30)]
+                safe_forms    = list(ENCODED_FORMS.get(ch, []))
+                if occurrence_ctx == 'js_string':
+                    if ch == '"':   safe_forms.append('\\"')
+                    elif ch == "'": safe_forms.append("\\'")
+                if any(enc.lower() in search_window for enc in safe_forms):
+                    continue
+                occurrence_chars.append(ch)
 
-            # Build the safe encoding list for this char + context
-            safe_forms = list(ENCODED_FORMS.get(ch, []))
+            # Check breakout chars BEFORE xssP (base64 path)
+            if original_value and self._is_base64_value(original_value):
+                before_window = body[max(0, probe_idx - 5):probe_idx]
+                for ch in ['"', '>']:
+                    if ch in before_window and ch not in occurrence_chars:
+                        if not any(enc.lower() in before_window.lower()
+                                   for enc in ENCODED_FORMS.get(ch, [])):
+                            occurrence_chars.append(ch)
+                            occurrence_ctx = 'html_attr'
 
-            # In a JS string context, backslash escaping is safe ONLY for
-            # the matching quote character:
-            #   \" is safe for "  (server escaped the double quote)
-            #   \' is safe for '  (server escaped the single quote)
-            # Do NOT cross-add -- \" does not make ' safe and vice versa.
-            if context == 'js_string':
-                if ch == '"':
-                    safe_forms.append('\\"')
-                elif ch == "'":
-                    safe_forms.append("\\'")
+            # Drop backtick-only occurrences
+            if occurrence_chars == ['`']:
+                occurrence_chars = []
 
-            is_encoded = any(
-                enc.lower() in search_window
-                for enc in safe_forms
+            # Keep the most dangerous occurrence
+            # Prioritise occurrences with < or > (highest XSS impact)
+            occurrence_score = (
+                ('<' in occurrence_chars or '>' in occurrence_chars) * 100
+                + ('"' in occurrence_chars or "'" in occurrence_chars) * 10
+                + len(occurrence_chars)
             )
+            best_score = (
+                ('<' in best_chars or '>' in best_chars) * 100
+                + ('"' in best_chars or "'" in best_chars) * 10
+                + len(best_chars)
+            )
+            if occurrence_score > best_score:
+                best_chars   = occurrence_chars
+                best_context = occurrence_ctx
 
-            if is_encoded:
-                continue
+        return best_chars, best_context
 
-            # Raw char present with no safe encoding around it -- flag it
-            reflected.append(ch)
 
-        # Backtick alone is not sufficient for a finding.
-        # It is only dangerous alongside < > " ' (needed to break out of
-        # a template literal context that is itself breakable).
-        # If the only reflected char is ` suppress the finding entirely.
-        if reflected == ['`']:
-            reflected = []
 
-        return reflected, context
+
+
 
 
 
     def _determine_context(self, body, probe_idx):
         """
-        Look at the characters before the probe position to guess the
-        HTML/JS rendering context.
+        Determine the rendering context at probe_idx by walking backwards
+        through the response to find what HTML/JS structure surrounds it.
 
-        Contexts:
-          html_attr  -- inside an HTML attribute value  e.g. value="PROBE"
-          html_tag   -- inside an HTML tag              e.g. <tag PROBE>
-          js_string  -- inside a JavaScript string      e.g. var x = "PROBE"
-          html_text  -- in normal HTML text node        e.g. <p>PROBE</p>
-          unknown
+        Priority order (most specific first):
+          1. Inside a <script> block           -> js_string
+          2. Inside an HTML attribute value    -> html_attr
+          3. Inside an open HTML tag (no attr) -> html_tag
+          4. Inside an HTML text node          -> html_text
+          5. Unknown
+
+        Key fix: JS string detection ONLY triggers inside <script> blocks.
+        A pattern like href="VALUE" must not be mistaken for a JS assignment.
         """
-        snippet = body[max(0, probe_idx - 200): probe_idx]
+        snippet = body[max(0, probe_idx - 500): probe_idx]
 
-        # JS string context -- look for var/let/const or = " or = '
-        if re.search(r'(var|let|const)\s+\w+\s*=\s*["\']', snippet):
-            return 'js_string'
-        if re.search(r'=\s*["\'][^"\']*$', snippet):
-            return 'js_string'
+        # ---- 1. Are we inside a <script> block? ----
+        # Find the last <script and last </script before the probe
+        last_script_open  = snippet.lower().rfind('<script')
+        last_script_close = snippet.lower().rfind('</script')
+        in_script = (last_script_open != -1
+                     and last_script_open > last_script_close)
 
-        # HTML attribute context -- inside a tag with an = sign
-        if re.search(r'<[a-zA-Z][^>]*[\s][a-zA-Z\-]+=[\"\']?[^>]*$', snippet):
-            return 'html_attr'
+        if in_script:
+            # Inside <script> -- check if we are inside a string literal
+            script_content = snippet[last_script_open:]
+            # Count unescaped double and single quotes to determine string state
+            in_dq = (script_content.count('"') -
+                     script_content.count('\\"')) % 2 == 1
+            in_sq = (script_content.count("'") -
+                     script_content.count("\\'")) % 2 == 1
+            if in_dq or in_sq:
+                return 'js_string'
+            return 'js_string'  # in script but not in a string -- still JS
 
-        # Inside an open HTML tag (no closing >)
-        if re.search(r'<[a-zA-Z][^>]*$', snippet):
+        # ---- 2. Are we inside an HTML tag? ----
+        # Find the last unclosed < before the probe
+        last_open_tag  = snippet.rfind('<')
+        last_close_tag = snippet.rfind('>')
+
+        if last_open_tag > last_close_tag:
+            # We are inside an open tag -- is it inside an attribute value?
+            tag_content = snippet[last_open_tag:]
+
+            # Check for attribute = "VALUE or = 'VALUE (unclosed)
+            # Match: word chars, optional space, =, then quote, then no closing quote
+            dq_attr = re.search(r'\s[\w\-]+=\s*"[^"]*$', tag_content)
+            sq_attr = re.search(r"\s[\w\-]+=\s*'[^']*$", tag_content)
+            uq_attr = re.search(r'\s[\w\-]+=\s*[^"\'\s>]+$', tag_content)
+
+            if dq_attr or sq_attr or uq_attr:
+                return 'html_attr'
             return 'html_tag'
 
-        # Default: HTML text node
-        last_close = snippet.rfind('>')
-        if last_close != -1:
+        # ---- 3. HTML text node (between tags) ----
+        if last_close_tag != -1:
             return 'html_text'
 
         return 'unknown'
+
 
     def _get_severity(self, reflected_chars):
         """
@@ -710,7 +884,7 @@ class BurpExtender(IBurpExtender, IScannerCheck):
                     probe_resp_bytes[probe_resp_info.getBodyOffset():])
 
                 reflected_chars, context = self._check_probe_reflection(
-                    probe_body_str)
+                    probe_body_str, param.getValue())
 
                 if reflected_chars:
                     severity = self._get_severity(reflected_chars)
